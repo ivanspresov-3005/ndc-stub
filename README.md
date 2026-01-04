@@ -77,3 +77,51 @@ This forms the **technical backbone** for the financial model.
 | Order | Realized revenue event |
 
 This mapping allows financial analysis **without abandoning NDC semantics**.
+
+---
+
+## Scenarios modeled (planned & in progress)
+
+### Scenario A — Classical RM baseline
+- static fare families
+- limited bundling
+- ancillaries sold post-selection
+- price determined primarily by inventory control
+
+### Scenario B — Dynamic offers (non-personalized)
+- offers constructed dynamically
+- attribute-based bundles
+- contextual pricing (route, time, demand)
+
+### Scenario C — Dynamic offers with personalization
+- bundle composition adapted to passenger context
+- willingness-to-pay signals influence pricing
+- higher attachment and conversion expected
+
+The **same NDC stub** is reused across all scenarios; only offer logic changes.
+
+---
+
+## Financial metrics of interest
+
+The modeling layer (to be built on top of the stub) focuses on:
+
+- Revenue per passenger uplift
+- Conversion uplift attributable to offer relevance
+- Ancillary attachment rate
+- Willingness-to-pay capture vs static pricing
+- Route-level revenue uplift distribution
+- Sensitivity to elasticity and behavioral assumptions
+
+---
+
+## Methodology (high level)
+
+1. Use the NDC stub to generate controlled offers
+2. Apply behavioral assumptions (conversion, attachment, WTP)
+3. Simulate purchase outcomes via OrderCreate
+4. Aggregate Order-level results into route-level metrics
+5. Run sensitivity analysis / Monte Carlo simulations
+
+The stub ensures **structural consistency** across all experiments.
+
