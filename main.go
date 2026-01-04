@@ -39,6 +39,17 @@ ITERATION 6:
 - Store last AirShoppingRS offer in memory (very simple stub state)
 - Validate OfferRef + OfferItemRef
 - Return OfferPriceRS with same Offer, marked priced/confirmed
+
+ITERATION 7:
+- Add OrderCreateRQ endpoint
+- Validate OfferRef + OfferItemRef against stored offer
+- Return OrderViewRS containing an Order created from the selected OfferItem
+- Keep the same "in-memory state" logic as Iteration 6
+
+ITERATION 8:
+- Add OrderRetrieveRQ endpoint: POST /ndc/orderretrieve
+- Store created orders in memory (map[OrderID]OrderViewRS)
+- Return OrderViewRS by OrderID
 */
 
 // --- Minimal XML models (super simplified) ---
@@ -59,6 +70,29 @@ type OfferPriceRQ struct {
 	Party        *Party    `xml:"Party,omitempty"`
 	OfferRef     string    `xml:"OfferRef"`
 	OfferItemRef string    `xml:"OfferItemRef"`
+}
+
+type OrderCreateRQ struct {
+	XMLName      xml.Name  `xml:"OrderCreateRQ"`
+	Version      string    `xml:"Version,attr,omitempty"`
+	Document     *Document `xml:"Document,omitempty"`
+	Party        *Party    `xml:"Party,omitempty"`
+	OfferRef     string    `xml:"OfferRef"`
+	OfferItemRef string    `xml:"OfferItemRef"`
+	// super-minimal payment placeholder (optional)
+	Payment *Payment `xml:"Payment,omitempty"`
+}
+
+type OrderRetrieveRQ struct {
+	XMLName  xml.Name  `xml:"OrderRetrieveRQ"`
+	Version  string    `xml:"Version,attr,omitempty"`
+	Document *Document `xml:"Document,omitempty"`
+	Party    *Party    `xml:"Party,omitempty"`
+	OrderID  string    `xml:"OrderID"`
+}
+
+type Payment struct {
+	Amount Amount `xml:"Amount"`
 }
 
 type Document struct {
@@ -132,6 +166,16 @@ type OfferPriceRS struct {
 	DataLists     DataLists   `xml:"DataLists"`
 	OffersGroup   OffersGroup `xml:"OffersGroup"`
 	PricedInd     string      `xml:"PricedInd,attr,omitempty"` // "true"
+}
+
+type OrderViewRS struct {
+	XMLName       xml.Name  `xml:"OrderViewRS"`
+	CorrelationID string    `xml:"CorrelationID,omitempty"`
+	Version       string    `xml:"Version,attr,omitempty"`
+	Document      *Document `xml:"Document,omitempty"`
+	Party         *Party    `xml:"Party,omitempty"`
+	DataLists     DataLists `xml:"DataLists"`
+	Order         Order     `xml:"Order"`
 }
 
 type DataLists struct {
@@ -247,6 +291,30 @@ type Service struct {
 	PriceDetail          PriceDetail `xml:"PriceDetail"`
 }
 
+// -------------------- ITERATION 7: ORDER --------------------
+
+type Order struct {
+	OrderID    string      `xml:"OrderID"`
+	Status     string      `xml:"Status"` // CREATED
+	OrderItems OrderItems2 `xml:"OrderItems"`
+	TotalPrice Amount      `xml:"TotalPrice"`
+	CreatedAt  string      `xml:"CreatedAt"`
+}
+
+type OrderItems2 struct {
+	OrderItem []OrderItem `xml:"OrderItem"`
+}
+
+type OrderItem struct {
+	OrderItemID   string      `xml:"OrderItemID"`
+	OfferRef      string      `xml:"OfferRef"`
+	OfferItemRef  string      `xml:"OfferItemRef"`
+	JourneyRef    string      `xml:"JourneyRef"`
+	PassengerRefs string      `xml:"PassengerRefs"`
+	PriceDetail   PriceDetail `xml:"PriceDetail"`
+	Services      Services    `xml:"Services"`
+}
+
 // -------------------- STUB STATE --------------------
 
 type storedOffer struct {
@@ -258,23 +326,31 @@ type storedOffer struct {
 var (
 	stateMu sync.RWMutex
 	state   *storedOffer
+
+	ordersMu sync.RWMutex
+	orders   = map[string]OrderViewRS{} // OrderID -> OrderViewRS
 )
 
 // -------------------- SERVER --------------------
 
 func main() {
 	mux := http.NewServeMux()
+
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
 
 	mux.HandleFunc("/ndc/airshopping", airShopping)
-	mux.HandleFunc("/ndc/offerprice", offerPrice) // ITERATION 6
+	mux.HandleFunc("/ndc/offerprice", offerPrice)
+	mux.HandleFunc("/ndc/ordercreate", orderCreate)
+	mux.HandleFunc("/ndc/orderretrieve", orderRetrieve)
 
 	log.Println("NDC stub listening on http://localhost:8080")
 	log.Fatal(http.ListenAndServe(":8080", withLogging(mux)))
 }
+
+// -------------------- HANDLERS --------------------
 
 func airShopping(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -283,12 +359,8 @@ func airShopping(w http.ResponseWriter, r *http.Request) {
 	}
 
 	bodyBytes, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "cannot read body", http.StatusBadRequest)
-		return
-	}
-	if strings.TrimSpace(string(bodyBytes)) == "" {
-		http.Error(w, "empty body", http.StatusBadRequest)
+	if err != nil || strings.TrimSpace(string(bodyBytes)) == "" {
+		http.Error(w, "invalid body", http.StatusBadRequest)
 		return
 	}
 
@@ -306,7 +378,7 @@ func airShopping(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// pax list (default 1 ADT if missing)
+	// pax list default 1 ADT
 	ptcs := []string{"ADT"}
 	if rq.Travelers != nil && len(rq.Travelers.Traveler) > 0 {
 		ptcs = ptcs[:0]
@@ -319,7 +391,7 @@ func airShopping(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// PassengerList + IDs
+	// PassengerList
 	passengers := make([]Passenger, 0, len(ptcs))
 	passengerIDs := make([]string, 0, len(ptcs))
 	for i, ptc := range ptcs {
@@ -329,7 +401,6 @@ func airShopping(w http.ResponseWriter, r *http.Request) {
 	}
 	paxRefs := strings.Join(passengerIDs, " ")
 
-	// FlightSegment + Journey
 	seg := FlightSegment{
 		SegmentKey:       "SEG1",
 		Departure:        SegmentDeparture{AirportCode: from, Date: date},
@@ -340,8 +411,7 @@ func airShopping(w http.ResponseWriter, r *http.Request) {
 	journey := PaxJourney{JourneyKey: "J1", PaxSegmentRef: "SEG1"}
 
 	// Flight pricing breakdown
-	baseTotal := 0.0
-	taxTotal := 0.0
+	baseTotal, taxTotal := 0.0, 0.0
 	for _, ptc := range ptcs {
 		switch ptc {
 		case "CHD":
@@ -356,14 +426,13 @@ func airShopping(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	flightTotal := baseTotal + taxTotal
-
 	flightPrice := PriceDetail{
 		BaseAmount:  Amount{Code: "EUR", Value: fmt.Sprintf("%.2f", baseTotal)},
 		Taxes:       Taxes{TotalTaxAmount: Amount{Code: "EUR", Value: fmt.Sprintf("%.2f", taxTotal)}},
 		TotalAmount: Amount{Code: "EUR", Value: fmt.Sprintf("%.2f", flightTotal)},
 	}
 
-	// BAG service priced per pax
+	// BAG service
 	bagBase := 25.0 * float64(len(ptcs))
 	bagService := Service{
 		ServiceID:            "SRV1",
@@ -414,13 +483,9 @@ func airShopping(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
-	// Store state for OfferPrice
+	// store offer state
 	stateMu.Lock()
-	state = &storedOffer{
-		OfferID:     offerID,
-		OfferItemID: offerItemID,
-		AirShopping: rs,
-	}
+	state = &storedOffer{OfferID: offerID, OfferItemID: offerItemID, AirShopping: rs}
 	stateMu.Unlock()
 
 	writeXML(w, http.StatusOK, rs)
@@ -431,17 +496,11 @@ func offerPrice(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "use POST", http.StatusMethodNotAllowed)
 		return
 	}
-
 	bodyBytes, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "cannot read body", http.StatusBadRequest)
+	if err != nil || strings.TrimSpace(string(bodyBytes)) == "" {
+		http.Error(w, "invalid body", http.StatusBadRequest)
 		return
 	}
-	if strings.TrimSpace(string(bodyBytes)) == "" {
-		http.Error(w, "empty body", http.StatusBadRequest)
-		return
-	}
-
 	var rq OfferPriceRQ
 	if err := xml.Unmarshal(bodyBytes, &rq); err != nil {
 		http.Error(w, "invalid xml body", http.StatusBadRequest)
@@ -455,20 +514,11 @@ func offerPrice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	stateMu.RLock()
-	s := state
-	stateMu.RUnlock()
-
-	if s == nil {
-		http.Error(w, "no offer in memory: call AirShopping first", http.StatusBadRequest)
-		return
-	}
-	if offerRef != s.OfferID || itemRef != s.OfferItemID {
-		http.Error(w, "offer not found (OfferRef/OfferItemRef mismatch)", http.StatusBadRequest)
+	s, ok := loadStoredOffer(offerRef, itemRef, w)
+	if !ok {
 		return
 	}
 
-	// Build OfferPriceRS using stored AirShopping content (simplified)
 	rs := OfferPriceRS{
 		CorrelationID: "CORR-" + time.Now().Format("20060102150405"),
 		Version:       firstNonEmpty(rq.Version, s.AirShopping.Version),
@@ -480,6 +530,162 @@ func offerPrice(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeXML(w, http.StatusOK, rs)
+}
+
+func orderCreate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "use POST", http.StatusMethodNotAllowed)
+		return
+	}
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil || strings.TrimSpace(string(bodyBytes)) == "" {
+		http.Error(w, "invalid body", http.StatusBadRequest)
+		return
+	}
+
+	var rq OrderCreateRQ
+	if err := xml.Unmarshal(bodyBytes, &rq); err != nil {
+		http.Error(w, "invalid xml body", http.StatusBadRequest)
+		return
+	}
+
+	offerRef := strings.TrimSpace(rq.OfferRef)
+	itemRef := strings.TrimSpace(rq.OfferItemRef)
+	if offerRef == "" || itemRef == "" {
+		http.Error(w, "missing required fields: OfferRef, OfferItemRef", http.StatusBadRequest)
+		return
+	}
+
+	s, ok := loadStoredOffer(offerRef, itemRef, w)
+	if !ok {
+		return
+	}
+
+	selectedOffer := s.AirShopping.OffersGroup.CarrierOffers.Offer
+	var selectedItem OfferItem
+	found := false
+	for _, it := range selectedOffer.OfferItems.Items {
+		if it.OfferItemID == itemRef {
+			selectedItem = it
+			found = true
+			break
+		}
+	}
+	if !found {
+		http.Error(w, "offer item not found in stored offer", http.StatusBadRequest)
+		return
+	}
+
+	total := parseAmount(selectedItem.PriceDetail.TotalAmount.Value)
+	for _, svc := range selectedItem.Services.Service {
+		total += parseAmount(svc.PriceDetail.TotalAmount.Value)
+	}
+
+	orderID := "ORD-" + time.Now().Format("20060102150405")
+	rs := OrderViewRS{
+		CorrelationID: "CORR-" + time.Now().Format("20060102150405"),
+		Version:       firstNonEmpty(rq.Version, s.AirShopping.Version),
+		Document:      rq.Document,
+		Party:         rq.Party,
+		DataLists:     s.AirShopping.DataLists,
+		Order: Order{
+			OrderID:    orderID,
+			Status:     "CREATED",
+			CreatedAt:  time.Now().Format(time.RFC3339),
+			TotalPrice: Amount{Code: "EUR", Value: fmt.Sprintf("%.2f", total)},
+			OrderItems: OrderItems2{
+				OrderItem: []OrderItem{
+					{
+						OrderItemID:   "ORDITEM-1",
+						OfferRef:      offerRef,
+						OfferItemRef:  itemRef,
+						JourneyRef:    selectedItem.JourneyRef,
+						PassengerRefs: selectedItem.PassengerRefs,
+						PriceDetail:   selectedItem.PriceDetail,
+						Services:      selectedItem.Services,
+					},
+				},
+			},
+		},
+	}
+
+	// ITERATION 8: store order by OrderID
+	ordersMu.Lock()
+	orders[orderID] = rs
+	ordersMu.Unlock()
+
+	writeXML(w, http.StatusOK, rs)
+}
+
+func orderRetrieve(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "use POST", http.StatusMethodNotAllowed)
+		return
+	}
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil || strings.TrimSpace(string(bodyBytes)) == "" {
+		http.Error(w, "invalid body", http.StatusBadRequest)
+		return
+	}
+
+	var rq OrderRetrieveRQ
+	if err := xml.Unmarshal(bodyBytes, &rq); err != nil {
+		http.Error(w, "invalid xml body", http.StatusBadRequest)
+		return
+	}
+
+	orderID := strings.TrimSpace(rq.OrderID)
+	if orderID == "" {
+		http.Error(w, "missing required field: OrderID", http.StatusBadRequest)
+		return
+	}
+
+	ordersMu.RLock()
+	rs, ok := orders[orderID]
+	ordersMu.RUnlock()
+
+	if !ok {
+		http.Error(w, "order not found", http.StatusNotFound)
+		return
+	}
+
+	// Return a fresh correlation id, but keep order data
+	rs.CorrelationID = "CORR-" + time.Now().Format("20060102150405")
+	// Optionally override document/party from request (handy for testing)
+	if rq.Document != nil {
+		rs.Document = rq.Document
+	}
+	if rq.Party != nil {
+		rs.Party = rq.Party
+	}
+	rs.Version = firstNonEmpty(rq.Version, rs.Version)
+
+	writeXML(w, http.StatusOK, rs)
+}
+
+// -------------------- HELPERS --------------------
+
+func loadStoredOffer(offerRef, itemRef string, w http.ResponseWriter) (*storedOffer, bool) {
+	stateMu.RLock()
+	s := state
+	stateMu.RUnlock()
+
+	if s == nil {
+		http.Error(w, "no offer in memory: call AirShopping first", http.StatusBadRequest)
+		return nil, false
+	}
+	if offerRef != s.OfferID || itemRef != s.OfferItemID {
+		http.Error(w, "offer not found (OfferRef/OfferItemRef mismatch)", http.StatusBadRequest)
+		return nil, false
+	}
+	return s, true
+}
+
+func parseAmount(v string) float64 {
+	v = strings.TrimSpace(v)
+	var f float64
+	_, _ = fmt.Sscanf(v, "%f", &f)
+	return f
 }
 
 func writeXML(w http.ResponseWriter, status int, v any) {
